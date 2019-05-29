@@ -1,186 +1,223 @@
 pragma solidity ^0.4.25;
-import "./IToken.sol";
-import "./LSafeMath.sol";
-contract CpublicDex{
-  using LSafeMath for uint;
-  address public admin;
-  address public feeAccount;
-  uint public feeTake;
-  uint public freeUntilDate;
-  bool private depositingTokenFlag;
-  mapping (address => mapping (address => uint)) public tokens;
-  mapping (address => mapping (bytes32 => bool)) public orders;
-  mapping (address => mapping (bytes32 => uint)) public orderFills;
-  address public predecessor;
-  address public successor;
-  uint16 public version;
+
+contract SafeMath {
+  function safeMul(uint a, uint b) internal pure returns (uint) {
+    uint c = a * b;
+    assertValue(a == 0 || c / a == b);
+    return c;
+  }
+
+  function safeSub(uint a, uint b) internal pure returns (uint) {
+    assertValue(b <= a);
+    return a - b;
+  }
+
+  function safeAdd(uint a, uint b) internal pure returns (uint) {
+    uint c = a + b;
+    assertValue(c>=a && c>=b);
+    return c;
+  }
+
+  function assertValue(bool _assertion) public pure {
+    require(_assertion);
+  }
+}
+
+contract Token {
+  function totalSupply() public view returns (uint256);
+  function balanceOf(address _owner) public view returns (uint256 balance);
+  function transfer(address _to, uint256 _value) public returns (bool success);
+  function transferFrom(address _from, address _to, uint256 _value) public returns (bool success);
+  function approve(address _spender, uint256 _value)public returns (bool success);
+  function allowance(address _owner, address _spender) public view returns (uint256 remaining);
+  event Transfer(address indexed _from, address indexed _to, uint256 _value);
+  event Approval(address indexed _owner, address indexed _spender, uint256 _value);
+
+  uint public decimals;
+  string public name;
+}
+
+contract StandardToken is Token {
+
+  function transfer(address _to, uint256 _value) public returns (bool success) {
+    //Default assumes totalSupply can't be over max (2^256 - 1).
+    //If your token leaves out totalSupply and can issue more tokens as time goes on, you need to check if it doesn't wrap.
+    //Replace the if with this one instead.
+    if (balances[msg.sender] >= _value && balances[_to] + _value > balances[_to]) {
+    //if (balances[msg.sender] >= _value && _value > 0) {
+      balances[msg.sender] -= _value;
+      balances[_to] += _value;
+      emit Transfer(msg.sender, _to, _value);
+      return true;
+    } else { return false; }
+  }
+
+  function transferFrom(address _from, address _to, uint256 _value) public returns (bool success) {
+    //same as above. Replace this line with the following if you want to protect against wrapping uints.
+    if (balances[_from] >= _value && allowed[_from][msg.sender] >= _value && balances[_to] + _value > balances[_to]) {
+    //if (balances[_from] >= _value && allowed[_from][msg.sender] >= _value && _value > 0) {
+      balances[_to] += _value;
+      balances[_from] -= _value;
+      allowed[_from][msg.sender] -= _value;
+      emit Transfer(_from, _to, _value);
+      return true;
+    } else { return false; }
+  }
+
+  function balanceOf(address _owner) public view returns (uint256 balance) {
+    return balances[_owner];
+  }
+
+  function approve(address _spender, uint256 _value) public returns (bool success) {
+    allowed[msg.sender][_spender] = _value;
+    emit Approval(msg.sender, _spender, _value);
+    return true;
+  }
+
+  function allowance(address _owner, address _spender) public constant returns (uint256 remaining) {
+    return allowed[_owner][_spender];
+  }
+
+  mapping(address => uint256) balances;
+
+  mapping (address => mapping (address => uint256)) allowed;
+
+  uint256 public totalSupply;
+}
+
+contract ReserveToken is StandardToken, SafeMath {
+  address public minter;
+  constructor() public{
+    minter = msg.sender;
+  }
+  function create(address account, uint amount) public {
+    require(msg.sender == minter);
+    balances[account] = safeAdd(balances[account], amount);
+    totalSupply = safeAdd(totalSupply, amount);
+  }
+  function destroy(address account, uint amount) public {
+    require (msg.sender == minter);
+    require (balances[account] >= amount);
+    balances[account] = safeSub(balances[account], amount);
+    totalSupply = safeSub(totalSupply, amount);
+  }
+}
+
+
+
+contract CpublicDex is SafeMath {
+//   address public admin; //the admin address
+//   address public feeAccount; //the account that will receive fees
+//   address public accountLevelsAddr; //the address of the AccountLevels contract
+//   uint public feeMake; //percentage times (1 ether)
+//   uint public feeTake; //percentage times (1 ether)
+//   uint public feeRebate; //percentage times (1 ether)
+  mapping (address => mapping (address => uint)) public tokens; //mapping of token addresses to mapping of account balances (token=0 means Ether)
+  mapping (address => mapping (bytes32 => bool)) public orders; //mapping of user accounts to mapping of order hashes to booleans (true = submitted by user, equivalent to offchain signature)
+  mapping (address => mapping (bytes32 => uint)) public orderFills; //mapping of user accounts to mapping of order hashes to uints (amount of order that has been filled)
+
   event Order(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user);
   event Cancel(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s);
   event Trade(address tokenGet, uint amountGet, address tokenGive, uint amountGive, address get, address give);
   event Deposit(address token, address user, uint amount, uint balance);
   event Withdraw(address token, address user, uint amount, uint balance);
-  event FundsMigrated(address user, address newContract);
-  modifier isAdmin() {
-      require(msg.sender == admin);
-      _;
-  }
-  constructor (address admin_, address feeAccount_, uint feeTake_, uint freeUntilDate_, address predecessor_) public {
-    admin = admin_;
-    feeAccount = feeAccount_;
-    feeTake = feeTake_;
-    freeUntilDate = freeUntilDate_;
-    depositingTokenFlag = false;
-    predecessor = predecessor_;
-    if (predecessor != address(0)) {
-      version = CpublicDex(predecessor).version() + 1;
-    } else {
-      version = 1;
-    }
-  }
-  function() public {
-    revert();
-  }
-  function changeAdmin(address admin_) public isAdmin {
-    require(admin_ != address(0));
-    admin = admin_;
-  }
-  function changeFeeAccount(address feeAccount_) public isAdmin {
-    feeAccount = feeAccount_;
-  }
-  function changeFeeTake(uint feeTake_) public isAdmin {
-    require(feeTake_ <= feeTake);
-    feeTake = feeTake_;
-  }
-  function changeFreeUntilDate(uint freeUntilDate_) public isAdmin {
-    freeUntilDate = freeUntilDate_;
-  }
-  function setSuccessor(address successor_) public isAdmin {
-    require(successor_ != address(0));
-    successor = successor_;
-  }
-  function deposit() public payable {
-    tokens[0][msg.sender] = tokens[0][msg.sender].add(msg.value);
+
+
+  function deposit() payable public {
+    tokens[0][msg.sender] = safeAdd(tokens[0][msg.sender], msg.value);
     emit Deposit(0, msg.sender, msg.value, tokens[0][msg.sender]);
   }
+
   function withdraw(uint amount) public {
     require(tokens[0][msg.sender] >= amount);
-    tokens[0][msg.sender] = tokens[0][msg.sender].sub(amount);
-    msg.sender.transfer(amount);
+    tokens[0][msg.sender] = safeSub(tokens[0][msg.sender], amount);
+    require(msg.sender.call.value(amount)());
     emit Withdraw(0, msg.sender, amount, tokens[0][msg.sender]);
   }
+
   function depositToken(address token, uint amount) public {
-    require(token != 0);
-    depositingTokenFlag = true;
-    require(IToken(token).transferFrom(msg.sender, this, amount));
-    depositingTokenFlag = false;
-    tokens[token][msg.sender] = tokens[token][msg.sender].add(amount);
+    //remember to call Token(address).approve(this, amount) or this contract will not be able to do the transfer on your behalf.
+    require(token!=0);
+    require(Token(token).transferFrom(msg.sender, this, amount));
+    tokens[token][msg.sender] = safeAdd(tokens[token][msg.sender], amount);
     emit Deposit(token, msg.sender, amount, tokens[token][msg.sender]);
- }
+  }
+
   function withdrawToken(address token, uint amount) public {
-    require(token != 0);
+    require(token!=0);
     require(tokens[token][msg.sender] >= amount);
-    tokens[token][msg.sender] = tokens[token][msg.sender].sub(amount);
-    require(IToken(token).transfer(msg.sender, amount));
+    tokens[token][msg.sender] = safeSub(tokens[token][msg.sender], amount);
+    require(Token(token).transfer(msg.sender, amount));
     emit Withdraw(token, msg.sender, amount, tokens[token][msg.sender]);
   }
+
   function balanceOf(address token, address user) public constant returns (uint) {
     return tokens[token][user];
   }
-  function order(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce) public {
+
+  function order(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce) public{
     bytes32 hash = keccak256(abi.encodePacked(this, tokenGet, amountGet, tokenGive, amountGive, expires, nonce));
     orders[msg.sender][hash] = true;
     emit Order(tokenGet, amountGet, tokenGive, amountGive, expires, nonce, msg.sender);
   }
+
   function trade(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s, uint amount) public {
+    //amount is in amountGet terms
     bytes32 hash = keccak256(abi.encodePacked(this, tokenGet, amountGet, tokenGive, amountGive, expires, nonce));
     require((
-      (orders[user][hash] || ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash)), v, r, s) == user) &&
+      (orders[user][hash] || ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash)),v,r,s) == user) &&
       block.number <= expires &&
-      orderFills[user][hash].add(amount) <= amountGet
+      safeAdd(orderFills[user][hash], amount) <= amountGet
     ));
     tradeBalances(tokenGet, amountGet, tokenGive, amountGive, user, amount);
-    orderFills[user][hash] = orderFills[user][hash].add(amount);
-    emit Trade(tokenGet, amount, tokenGive, amountGive.mul(amount) / amountGet, user, msg.sender);
+    orderFills[user][hash] = safeAdd(orderFills[user][hash], amount);
+    emit Trade(tokenGet, amount, tokenGive, amountGive * amount / amountGet, user, msg.sender);
   }
+
+  //function tradeBalances(address tokenGet, uint amountGet, address tokenGive, uint amountGive, address user, uint amount) private {
   function tradeBalances(address tokenGet, uint amountGet, address tokenGive, uint amountGive, address user, uint amount) private {
+    // uint feeMakeXfer = safeMul(amount, feeMake) / (1 ether);
+    // uint feeTakeXfer = safeMul(amount, feeTake) / (1 ether);
+    //uint feeRebateXfer = 0;
 
-    uint feeTakeXfer = 0;
-
-    if (now >= freeUntilDate) {
-      feeTakeXfer = amount.mul(feeTake).div(1 ether);
-    }
-
-    tokens[tokenGet][msg.sender] = tokens[tokenGet][msg.sender].sub(amount.add(feeTakeXfer));
-    tokens[tokenGet][user] = tokens[tokenGet][user].add(amount);
-    tokens[tokenGet][feeAccount] = tokens[tokenGet][feeAccount].add(feeTakeXfer);
-    tokens[tokenGive][user] = tokens[tokenGive][user].sub(amountGive.mul(amount).div(amountGet));
-    tokens[tokenGive][msg.sender] = tokens[tokenGive][msg.sender].add(amountGive.mul(amount).div(amountGet));
+    //tokens[tokenGet][msg.sender] = safeSub(tokens[tokenGet][msg.sender], safeAdd(amount, feeTakeXfer));
+    tokens[tokenGet][msg.sender] = safeSub(tokens[tokenGet][msg.sender], amount);
+    //tokens[tokenGet][user] = safeAdd(tokens[tokenGet][user], safeSub(safeAdd(amount, feeRebateXfer), feeMakeXfer));
+    tokens[tokenGet][user] = safeAdd(tokens[tokenGet][user], amount);
+    //tokens[tokenGet][feeAccount] = safeAdd(tokens[tokenGet][feeAccount], safeSub(safeAdd(feeMakeXfer, feeTakeXfer), feeRebateXfer));
+    tokens[tokenGive][user] = safeSub(tokens[tokenGive][user], safeMul(amountGive, amount) / amountGet);
+    tokens[tokenGive][msg.sender] = safeAdd(tokens[tokenGive][msg.sender], safeMul(amountGive, amount) / amountGet);
   }
-  function testTrade(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s, uint amount, address sender) public constant returns(bool) {
+
+  function testTrade(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s, uint amount, address sender) payable public returns(bool) {
     if (!(
       tokens[tokenGet][sender] >= amount &&
       availableVolume(tokenGet, amountGet, tokenGive, amountGive, expires, nonce, user, v, r, s) >= amount
-      )) {
-      return false;
-    } else {
-      return true;
-    }
+    )) return false;
+    return true;
   }
-  function availableVolume(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s) public constant returns(uint) {
+
+  function availableVolume(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user, uint8 v, bytes32 r, bytes32 s) payable public returns(uint){
     bytes32 hash = keccak256(abi.encodePacked(this, tokenGet, amountGet, tokenGive, amountGive, expires, nonce));
     if (!(
-      (orders[user][hash] || ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash)), v, r, s) == user) &&
+      (orders[user][hash] || ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash)),v,r,s) == user) &&
       block.number <= expires
-      )) {
-      return 0;
-    }
-    uint[2] memory available;
-    available[0] = amountGet.sub(orderFills[user][hash]);
-    available[1] = tokens[tokenGive][user].mul(amountGet) / amountGive;
-    if (available[0] < available[1]) {
-      return available[0];
-    } else {
-      return available[1];
-    }
+    )) return 0;
+    uint available1 = safeSub(amountGet, orderFills[user][hash]);
+    uint available2 = safeMul(tokens[tokenGive][user], amountGet) / amountGive;
+    if (available1<available2) return available1;
+    return available2;
   }
+
+  function amountFilled(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, address user) public constant returns(uint) {
+    bytes32 hash = keccak256(abi.encodePacked(this, tokenGet, amountGet, tokenGive, amountGive, expires, nonce));
+    return orderFills[user][hash];
+  }
+
   function cancelOrder(address tokenGet, uint amountGet, address tokenGive, uint amountGive, uint expires, uint nonce, uint8 v, bytes32 r, bytes32 s) public {
     bytes32 hash = keccak256(abi.encodePacked(this, tokenGet, amountGet, tokenGive, amountGive, expires, nonce));
-    require ((orders[msg.sender][hash] || ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash)), v, r, s) == msg.sender));
+    require((orders[msg.sender][hash] || ecrecover(keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash)),v,r,s) == msg.sender));
     orderFills[msg.sender][hash] = amountGet;
     emit Cancel(tokenGet, amountGet, tokenGive, amountGive, expires, nonce, msg.sender, v, r, s);
-  }
-  function migrateFunds(address newContract, address[] tokens_) public {
-    require(newContract != address(0));
-    CpublicDex newExchange = CpublicDex(newContract);
-    uint etherAmount = tokens[0][msg.sender];
-    if (etherAmount > 0) {
-      tokens[0][msg.sender] = 0;
-      newExchange.depositForUser.value(etherAmount)(msg.sender);
-    }
-    for (uint16 n = 0; n < tokens_.length; n++) {
-      address token = tokens_[n];
-      require(token != address(0));
-      uint tokenAmount = tokens[token][msg.sender];
-      if (tokenAmount != 0) {
-      	require(IToken(token).approve(newExchange, tokenAmount));
-      	tokens[token][msg.sender] = 0;
-      	newExchange.depositTokenForUser(token, tokenAmount, msg.sender);
-      }
-    }
-    emit FundsMigrated(msg.sender, newContract);
-  }
-  function depositForUser(address user) public payable {
-    require(user != address(0));
-    require(msg.value > 0);
-    tokens[0][user] = tokens[0][user].add(msg.value);
-  }
-  function depositTokenForUser(address token, uint amount, address user) public {
-    require(token != address(0));
-    require(user != address(0));
-    require(amount > 0);
-    depositingTokenFlag = true;
-    require(IToken(token).transferFrom(msg.sender, this, amount));
-    depositingTokenFlag = false;
-    tokens[token][user] = tokens[token][user].add(amount);
   }
 }
